@@ -1,0 +1,261 @@
+#!/bin/bash
+[ "$(pgrep -fn $0)" -ne "$(pgrep -fo $0)" ] && echo "$0 already running" && exit 127;
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+
+sp="/-\|"
+sc=0
+
+_spin() {
+   printf "\b${sp:sc++:1}"
+   ((sc==${#sp})) && sc=0
+}
+_endspin() {
+   [[ sc -ne 0 ]] && printf "\r%s\n" "$@"
+}
+
+_progressbar() {
+# Process data
+    let _progress=(${1}*100/${2}*100)/100
+    let _done=(${_progress}*4)/10
+    let _left=40-$_done
+# Build progressbar string lengths
+    _fill=$(printf "%${_done}s")
+    _empty=$(printf "%${_left}s")
+
+# 1.2 Build progressbar strings and print the ProgressBar line
+# 1.2.1 Output example:                           
+# 1.2.1.1 Progress : [########################################] 100%
+printf "\rProgress : [${_fill// /#}${_empty// /-}] ${_progress}%% ${1}/${2}"
+}
+
+# Be aware of the order
+# for rclone mounts
+mountNames=(  "Rclone local pool"                     "Rclone cloud pool"                         )
+mountFSs=(    "storage:/data"                                "bdrive:/data"                                   )
+rawFSs=(      "storage:"                                "bdrive_raw:"                               )
+mountPoints=( "/mnt/cache-pool/data"                "/mnt/disk1/data"                    )
+testFiles=(   "/mnt/cache-pool/data/.mounted/local" "/mnt/disk1/data/.mounted/cloud"     )
+
+# Rclone configs
+rcLogin="--rc-user=plex --rc-pass=pl3xpl3x"
+rcAddr="192.168.1.200:5572"
+rcConf="/boot/config/plugins/rclone/.rclone.conf"
+RRC="rclone rc --rc-addr $rcAddr $rcLogin"
+RC="rclone"
+
+cachePath="/mnt/tmp-disk/tmp/.rclone"
+vfsOpt='{   "CacheMode": 3,
+            "DirCacheTime": 180000000000000000,
+            "CacheMexAge": 180000000000000000,
+            "GID": 100,
+            "UID": 99,
+            "Umask": 2}' \
+mountOpt='{ "AllowOther": true,
+            "DeviceName": "rclone",
+            "AllowNonEmpty": false}'
+
+[ ! -d $cachePath ] && echo "Waiting for $cachePath to be available"
+until [ -d $cachePath ]
+do
+     _spin
+     sleep 1
+done
+_endspin
+
+if ! ps aux | grep "rclone rcd --rc-web-gui" | grep -vq grep
+then
+  rclone rcd --rc-web-gui --rc-addr $rcAddr --rc-web-gui-no-open-browser $rcLogin --config $rcConf \
+             --cache-db-path=$cachePath --cache-dir=$cachePath --cache-chunk-path=$cachePath \
+             --rc-job-expire-duration=24h --rc-job-expire-interval=90s &
+  sleep 5
+fi
+#       LogLevelEmergency LogLevel = 0
+#       LogLevelAlert = 1
+#       LogLevelCritical = 2
+#       LogLevelError = 3 // Error - can't be suppressed
+#       LogLevelWarning = 4
+#       LogLevelNotice = 5 // Normal logging, -q suppresses
+#       LogLevelInfo  = 6 // Transfers, needs -v
+#       LogLevelDebug  = 7 // Debug level, needs -vv
+silent=($RRC options/set --json '{"main": {"LogLevel": 6}}')
+
+_status() {
+result=0
+[[ ! -z $1 ]] && imin=$1 || imin=0
+[[ ! -z $2 ]] && imax=$2 || [[ ! -z $1 ]] && imax=$(($1+1))
+[[ -z $imax ]] && imax=${#mountNames[@]}
+for ((i=$imin; i<$imax; i++))
+do
+  mountName="${mountNames[$i]}"
+  mountPoint="${mountPoints[$i]}"
+  testFile="${testFiles[$i]}"
+  echo -n "$mountName is "
+  if mount | grep $mountPoint | grep -vq grep && ls $testFile > /dev/null 2>&1; then
+    echo -e "${GREEN}mounted${NC}"
+  else
+    echo -e "${RED}Not mounted${NC}"
+    result=1
+  fi
+done
+return $result
+}
+
+_mount() {
+[[ ! -z $1 ]] && jmin=$1 || jmin=0
+[[ ! -z $2 ]] && jmax=$2 || [[ ! -z $1 ]] && jmax=$(($1+1))
+[[ -z $jmax ]] && jmax=${#mountNames[@]}
+for ((j=$jmin; j<$jmax; j++))
+do
+  if ! _status $j  > /dev/null 2>&1
+  then
+    _unmount $j
+    mountFS="${mountFSs[$j]}"
+    mountName="${mountNames[$j]}"
+    mountPoint="${mountPoints[$j]}"
+    testFile="${testFiles[$j]}"
+    [ ! -d $mountPoint ] && echo "Waiting for $mountPoint to be available"
+    until [ -d $mountPoint ]
+    do
+      _spin
+      sleep 1
+    done
+    _endspin
+    [ ! -d $mountPoint ] && echo "Waiting for $mountPoint to be available"
+    rrcRes=$($RRC mount/mount fs="$mountFS/" mountPoint="$mountPoint" vfsOpt="$vfsOpt" mountOpt="$mountOpt")
+    [[ $rrcRes != "{}" ]] && echo $rrcRes | jq
+    rrcRes=$($RRC vfs/refresh fs="$mountFS" recursive=true _async=true)
+    mkdir -p ${testFile%/*}
+    touch $testFile
+    _status $j
+  else
+    _status $j
+  fi
+done
+}
+
+_unmount() {
+[[ ! -z $1 ]] && kmin=$1 || kmin=0
+[[ ! -z $2 ]] && kmax=$2 || [[ ! -z $1 ]] && kmax=$(($1+1))
+[[ -z $kmax ]] && kmax=${#mountNames[@]}
+for ((k=$kmin; k<$kmax; k++))
+do
+  mountPoint="${mountPoints[$k]}"
+  mount | grep $mountPoint | grep -vq grep && [[ $k -gt 0 ]] && $RRC mount/unmount mountPoint=$mountPoint > /dev/null 2>&1
+  mount | grep $mountPoint | grep -vq grep && umount $mountPoint || fusermount3 -zu $mountPoint > /dev/null 2>&1
+  [[ -z $1 ]] && _status $k
+done
+}
+
+_download() {
+  $RRC options/set --json '{"filter": {"IncludeRule": ["*"]}}'
+  $RRC sync/copy srcFs="${mountFSs[2]}" dstFs="${mountFSs[1]}" _async=true
+}
+
+_upload() {
+  $RRC options/set --json '{"filter": {"IncludeRule": ["data/Medias_*/**"]}}'
+  $RRC sync/copy srcFs="${mountFSs[1]}" dstFs="${mountFSs[2]}" _async=true
+}
+_upsync() {
+  $RRC options/set --json '{"filter": {"IncludeRule": ["data/Medias_*/**"]}}'
+  $RRC sync/sync srcFs="${mountFSs[1]}" dstFs="${mountFSs[2]}" _async=true
+}
+
+_clean() {
+#echo "Cleaning $unionDataPath from exclusion"
+#for d in downloads
+#do
+#  rm -rf "$unionDataPath/$d"
+#done
+result=0
+[[ ! -z $1 ]] && imin=$1 || imin=2
+[[ ! -z $2 ]] && imax=$2 || [[ ! -z $1 ]] && [[ $1 -lt ${#mountNames[@]} ]] && imax=$(($1+1))
+[[ -z $imax ]] && imax=${#mountNames[@]}
+for ((i=$imin; i<$imax; i++))
+do
+  mountName="${mountNames[$i]}"
+  mountPoint="${mountPoints[$i]}"
+  mountFS="${mountFSs[$i]}"
+  rawFS="${rawFSs[$i]}"
+
+  echo "Deleting files from $mountName"
+  progress=1
+  total=$(find $unionDataPath -type f -name "*_HIDDEN~" | wc -l)
+  find $unionDataPath -type f -name "*_HIDDEN~" | while read l
+  do
+    r=${l//$unionDataPath}
+    r=${r//_HIDDEN~}
+    _progressbar $progress $total
+    $RC deletefile "$mountFS$r" #> /dev/null 2>&1
+    rm "$l"
+    ((progress++))
+    [[ $progress -ge $total ]] && printf '. Done.\n'
+  done
+  echo "Deleting folders from $mountName"
+  progress=1
+  total=$(find $unionDataPath -type d -name "*_HIDDEN~" | wc -l)
+  find $unionDataPath -type d -name "*_HIDDEN~" | while read l
+  do
+    r=${l//$unionDataPath}
+    r=${r//_HIDDEN~}
+    _progressbar $progress $total
+    $RC rmdir "$mountFS:$r"
+    rm "$l"
+    ((progress++))
+    [[ $progress -ge $total ]] && printf '. Done.\n'
+  done
+  echo "Cleaning $mountName empty directories"
+  rrcRes=($RRC operations/rmdirs fs=$mountFS remote="$r" _async=true)
+  echo "Cleaning $mountName trash"
+  rrcRes=$($RRC operations/cleanup fs=$rawFS _async=true)
+  echo "Deduping $mountFS"
+  $RC dedupe newest $rawFS
+done
+#echo "Cleaning .unionfs"
+#find $unionDataPath -type f -name "*_HIDDEN~" -delete
+#find $unionDataPath -type d -name "*_HIDDEN~" -delete
+return $result
+}
+
+_jobstatus() {
+  $RRC --json "{ \"jobid\":$1 }" job/status
+}
+_jobstop() {
+  $RRC --json "{ \"jobid\":$1 }" job/stop
+}
+
+
+case "$1" in
+        mount)
+            _mount
+            ;;
+        unmount)
+            _unmount
+            ;;
+        status)
+            _status
+            ;;
+        download)
+            _download
+            ;;
+        upload)
+            _upload
+            ;;
+        upsync)
+            _upsync
+            ;;
+        clean)
+            _clean
+            ;;
+        jobstatus)
+            _jobstatus $2
+            ;;
+        jobstop)
+            _jobstop $2
+            ;;
+        *)
+            echo $"Usage: $0 {mount|unmount|status|download|upload|upsync|clean|jobstatus [job ID]|jobstop [job ID]}"
+            exit 1
+esac
